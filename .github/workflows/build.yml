@@ -477,7 +477,7 @@ jobs:
 
           make -j2 package/cloudflared/compile V=s
 
-      - name: Collect package
+      - name: Collect current package only
         shell: bash
         env:
           CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
@@ -485,7 +485,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p "feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}"
+          FEED_DIR="feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}"
+
+          rm -rf "$FEED_DIR"
+          mkdir -p "$FEED_DIR"
 
           APK="$(
             find sdk/bin/packages/${PACKAGE_ARCH} \
@@ -496,7 +499,7 @@ jobs:
 
           test -n "$APK"
 
-          cp "$APK" "feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}/"
+          cp "$APK" "$FEED_DIR/"
 
       - name: Create APK repository index
         working-directory: feed/releases/${{ needs.resolve-versions.outputs.openwrt_version }}/${{ env.PACKAGE_ARCH }}
@@ -517,6 +520,18 @@ jobs:
 
           if [[ "$APK_SIGN_KEY" != *"BEGIN PRIVATE KEY"* ]]; then
             echo "Errore: APK_SIGN_KEY non sembra una chiave privata PKCS#8 PEM."
+            exit 1
+          fi
+
+          echo "Pacchetti inclusi nell'indice:"
+          find . -maxdepth 1 -type f -name '*.apk' -printf '%f\n'
+
+          COUNT="$(
+            find . -maxdepth 1 -type f -name '*.apk' | wc -l
+          )"
+
+          if [[ "$COUNT" -ne 1 ]]; then
+            echo "Errore: l'indice deve contenere esattamente un pacchetto cloudflared."
             exit 1
           fi
 
