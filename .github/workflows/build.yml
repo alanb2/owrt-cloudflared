@@ -381,6 +381,16 @@ jobs:
 
           test -x "$APK_BIN"
 
+          if [[ -z "$APK_SIGN_KEY" ]]; then
+            echo "Errore: il secret APK_SIGN_KEY è vuoto."
+            exit 1
+          fi
+
+          if [[ "$APK_SIGN_KEY" != *"BEGIN PRIVATE KEY"* ]]; then
+            echo "Errore: APK_SIGN_KEY non sembra una chiave privata PKCS#8 PEM."
+            exit 1
+          fi
+
           mkdir -p "$RUNNER_TEMP/apk-keys"
 
           printf '%s\n' "$APK_SIGN_KEY" \
