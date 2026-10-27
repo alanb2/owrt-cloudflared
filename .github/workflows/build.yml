@@ -182,6 +182,15 @@ jobs:
 
           test -f feeds/packages/lang/golang/golang1.27/Makefile
 
+          ./scripts/feeds update packages
+          ./scripts/feeds install -f golang1.27
+
+          test -f package/feeds/packages/golang1.27/Makefile
+
+          echo "Ricetta golang1.27 registrata:"
+          grep -E '^(PKG_NAME|PKG_VERSION|PKG_RELEASE|PKG_HASH):=' \
+            package/feeds/packages/golang1.27/Makefile
+
       - name: Update Go recipe
         working-directory: sdk
         shell: bash
@@ -301,9 +310,10 @@ jobs:
           grep '^PKG_BUILD_DEPENDS:=' \
             feeds/packages/net/cloudflared/Makefile
 
-          echo "Ricetta Go 1.27:"
-          grep -E '^(GO_VERSION_MAJOR_MINOR|GO_VERSION_PATCH|GO_VERSION_RC|PKG_HASH):=' \
-            feeds/packages/lang/golang/golang1.27/Makefile
+          echo "Ricetta Go installata:"
+          test -f package/feeds/packages/golang1.27/Makefile
+          grep -E '^(PKG_NAME|PKG_VERSION|PKG_RELEASE|PKG_HASH):=' \
+            package/feeds/packages/golang1.27/Makefile
 
           echo "Compilazione Go 1.27 host:"
           make package/golang1.27/host/compile V=s
