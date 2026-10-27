@@ -8,6 +8,11 @@ on:
         required: true
         default: "2026.10.5"
         type: string
+      openwrt_version:
+        description: "Versione OpenWrt per cui compilare"
+        required: true
+        default: "25.12.6"
+        type: string
 
   schedule:
     - cron: "17 4 * * *"
@@ -22,57 +27,153 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  OPENWRT_VERSION: "25.12.6"
   TARGET: "rockchip/armv8"
   PACKAGE_ARCH: "aarch64_generic"
   FEED_URL: "https://alanb2.github.io/owrt-cloudflared"
 
 jobs:
-  check-upstream:
+  resolve-versions:
     runs-on: ubuntu-24.04
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      should_build: ${{ steps.version.outputs.should_build }}
+      cloudflared_version: ${{ steps.versions.outputs.cloudflared_version }}
+      openwrt_version: ${{ steps.versions.outputs.openwrt_version }}
+      should_build: ${{ steps.versions.outputs.should_build }}
 
     steps:
-      - name: Check latest stable cloudflared release
-        id: version
+      - name: Resolve cloudflared and OpenWrt versions
+        id: versions
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_CLOUDFLARED_VERSION: ${{ inputs.cloudflared_version }}
+          INPUT_OPENWRT_VERSION: ${{ inputs.openwrt_version }}
         run: |
           set -euo pipefail
 
-          LATEST="$(
-            gh api repos/cloudflare/cloudflared/releases/latest \
-              --jq '.tag_name' \
-              | sed 's/^v//'
-          )"
+          if [[ -n "$INPUT_CLOUDFLARED_VERSION" ]]; then
+            CF_VERSION="$INPUT_CLOUDFLARED_VERSION"
+          else
+            CF_VERSION="$(
+              gh api repos/cloudflare/cloudflared/releases/latest \
+                --jq '.tag_name' \
+                | sed 's/^v//'
+            )"
+          fi
 
-          if [[ ! "$LATEST" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Versione upstream non valida: $LATEST"
+          if [[ -n "$INPUT_OPENWRT_VERSION" ]]; then
+            OPENWRT_VERSION="$INPUT_OPENWRT_VERSION"
+          else
+            OPENWRT_VERSION="$(
+              curl --fail --location --retry 3 \
+                'https://downloads.openwrt.org/.versions.json' \
+                | python3 -c 'import json,sys; print(json.load(sys.stdin)["stable_version"])'
+            )"
+
+            if [[ -z "$OPENWRT_VERSION" ]]; then
+              echo "Impossibile determinare l'ultima release stabile OpenWrt."
+              exit 1
+            fi
+          fi
+
+          if [[ ! "$CF_VERSION" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Versione cloudflared non valida: $CF_VERSION"
             exit 1
           fi
 
-          LAST_BUILT="$(
-            gh api "repos/${GITHUB_REPOSITORY}/releases" \
-              --jq '[.[].tag_name | select(startswith("cloudflared-"))][0] // ""' \
-              | sed 's/^cloudflared-//'
-          )"
-
-          if [[ "$LATEST" == "$LAST_BUILT" ]]; then
-            echo "Nessuna nuova release: $LATEST"
-            echo "version=$LATEST" >> "$GITHUB_OUTPUT"
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Nuova release rilevata: $LATEST"
-            echo "version=$LATEST" >> "$GITHUB_OUTPUT"
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          if [[ ! "$OPENWRT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Versione OpenWrt non valida: $OPENWRT_VERSION"
+            exit 1
           fi
 
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            SHOULD_BUILD=true
+          else
+            LAST_BUILT="$(
+              gh api "repos/${GITHUB_REPOSITORY}/releases" \
+                --jq '[.[].tag_name | select(startswith("cloudflared-"))][0] // ""' \
+                | sed 's/^cloudflared-//'
+            )"
+
+            if [[ "$CF_VERSION" == "$LAST_BUILT" ]]; then
+              echo "Nessuna nuova release: $CF_VERSION"
+              SHOULD_BUILD=false
+            else
+              echo "Nuova release rilevata: $CF_VERSION"
+              SHOULD_BUILD=true
+            fi
+          fi
+
+          echo "cloudflared_version=$CF_VERSION" >> "$GITHUB_OUTPUT"
+          echo "openwrt_version=$OPENWRT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+
+  resolve-toolchain:
+    needs: resolve-versions
+    if: needs.resolve-versions.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      go_version: ${{ steps.go.outputs.go_version }}
+      go_major_minor: ${{ steps.go.outputs.go_major_minor }}
+      go_recipe_available: ${{ steps.go.outputs.go_recipe_available }}
+
+    steps:
+      - name: Resolve required Go version
+        id: go
+        shell: bash
+        env:
+          CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
+        run: |
+          set -euo pipefail
+
+          curl --fail --location --retry 3 \
+            "https://raw.githubusercontent.com/cloudflare/cloudflared/${CF_VERSION}/go.mod" \
+            -o "$RUNNER_TEMP/cloudflared-go.mod"
+
+          GO_VERSION="$(
+            awk '$1 == "go" { print $2; exit }' \
+              "$RUNNER_TEMP/cloudflared-go.mod"
+          )"
+
+          if [[ ! "$GO_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Versione Go non valida in go.mod: $GO_VERSION"
+            exit 1
+          fi
+
+          GO_MAJOR_MINOR="${GO_VERSION%.*}"
+
+          GO_RELEASES="$(
+            curl --fail --location --retry 3 \
+              'https://go.dev/dl/?mode=json'
+          )"
+
+          GO_LATEST_PATCH="$(
+            printf '%s' "$GO_RELEASES" \
+              | python3 -c 'import json,sys; data=json.load(sys.stdin); series=sys.argv[1]; versions=[r["version"].removeprefix("go") for r in data if r["version"].removeprefix("go").startswith(series+".")]; print(max(versions, key=lambda value: tuple(map(int, value.split(".")))))' \
+                "$GO_MAJOR_MINOR"
+          )"
+
+          GO_RECIPE_AVAILABLE="$(
+            curl --fail --location --silent \
+              "https://raw.githubusercontent.com/openwrt/packages/master/lang/golang/golang${GO_MAJOR_MINOR}/Makefile" \
+              | grep -q '^PKG_NAME:=golang' \
+              && echo true \
+              || echo false
+          )"
+
+          echo "Requisito cloudflared: Go $GO_VERSION"
+          echo "Serie Go richiesta: $GO_MAJOR_MINOR"
+          echo "Ultima patch stabile: Go $GO_LATEST_PATCH"
+          echo "Ricetta Go presente nel feed master: $GO_RECIPE_AVAILABLE"
+
+          echo "go_version=$GO_LATEST_PATCH" >> "$GITHUB_OUTPUT"
+          echo "go_major_minor=$GO_MAJOR_MINOR" >> "$GITHUB_OUTPUT"
+          echo "go_recipe_available=$GO_RECIPE_AVAILABLE" >> "$GITHUB_OUTPUT"
+
   build:
-    needs: check-upstream
-    if: github.event_name == 'workflow_dispatch' || needs.check-upstream.outputs.should_build == 'true'
+    needs:
+      - resolve-versions
+      - resolve-toolchain
+    if: needs.resolve-versions.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     permissions:
@@ -129,6 +230,8 @@ jobs:
 
       - name: Download and verify OpenWrt SDK
         shell: bash
+        env:
+          OPENWRT_VERSION: ${{ needs.resolve-versions.outputs.openwrt_version }}
         run: |
           set -euo pipefail
 
@@ -167,7 +270,7 @@ jobs:
           test -f feeds/packages/net/cloudflared/Makefile
           test -f feeds/packages/lang/golang/golang/Makefile
 
-      - name: Import Go 1.27 infrastructure
+      - name: Import current Go infrastructure
         working-directory: sdk
         shell: bash
         run: |
@@ -184,22 +287,47 @@ jobs:
           cp -a "$RUNNER_TEMP/packages-master/lang/golang" \
             feeds/packages/lang/golang
 
-          test -f feeds/packages/lang/golang/golang1.27/Makefile
-
           ./scripts/feeds update packages
-          ./scripts/feeds install -f golang1.27
 
-          test -f package/feeds/packages/golang1.27/Makefile
-
-          echo "Ricetta golang1.27 registrata:"
-          grep -E '^(PKG_NAME|PKG_VERSION|PKG_RELEASE|PKG_HASH):=' \
-            package/feeds/packages/golang1.27/Makefile
-
-      - name: Update Go recipe
+      - name: Install required Go recipe
         working-directory: sdk
+        env:
+          GO_MAJOR_MINOR: ${{ needs.resolve-toolchain.outputs.go_major_minor }}
+          GO_RECIPE_AVAILABLE: ${{ needs.resolve-toolchain.outputs.go_recipe_available }}
         shell: bash
         run: |
           set -euo pipefail
+
+          if [[ "$GO_RECIPE_AVAILABLE" != "true" ]]; then
+            echo "Errore: il feed OpenWrt packages master non contiene golang${GO_MAJOR_MINOR}."
+            echo "Aggiornare il workflow o attendere l'aggiornamento del feed."
+            exit 1
+          fi
+
+          test -f "feeds/packages/lang/golang/golang${GO_MAJOR_MINOR}/Makefile"
+
+          ./scripts/feeds install -f "golang${GO_MAJOR_MINOR}"
+
+          test -f "package/feeds/packages/golang${GO_MAJOR_MINOR}/Makefile"
+
+          echo "Ricetta Go registrata:"
+          grep -E '^(PKG_NAME|PKG_VERSION|PKG_RELEASE|PKG_HASH):=' \
+            "package/feeds/packages/golang${GO_MAJOR_MINOR}/Makefile"
+
+      - name: Update Go recipe
+        working-directory: sdk
+        env:
+          GO_VERSION: ${{ needs.resolve-toolchain.outputs.go_version }}
+          GO_MAJOR_MINOR: ${{ needs.resolve-toolchain.outputs.go_major_minor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GO_RECIPE_FILE="feeds/packages/lang/golang/golang${GO_MAJOR_MINOR}/Makefile"
+          GO_VALUES_FILE="feeds/packages/lang/golang/golang-values.mk"
+
+          test -f "$GO_RECIPE_FILE"
+          test -f "$GO_VALUES_FILE"
 
           GO_META_FILE="$RUNNER_TEMP/go-releases.json"
 
@@ -208,40 +336,38 @@ jobs:
             -o "$GO_META_FILE"
 
           GO_HASH="$(
-            python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); print(next(f["sha256"] for r in data if r["version"]=="go1.27.3" for f in r["files"] if f["filename"]=="go1.27.3.src.tar.gz"))' \
-              "$GO_META_FILE"
+            python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); version=sys.argv[2]; print(next(f["sha256"] for r in data if r["version"]=="go"+version for f in r["files"] if f["filename"]=="go"+version+".src.tar.gz"))' \
+              "$GO_META_FILE" "$GO_VERSION"
           )"
 
           test -n "$GO_HASH"
 
-          sed -i \
-            -e 's/^GO_VERSION_PATCH:=1$/GO_VERSION_PATCH:=3/' \
-            -e "s|^PKG_HASH:=.*|PKG_HASH:=${GO_HASH}|" \
-            feeds/packages/lang/golang/golang1.27/Makefile
+          GO_PATCH="${GO_VERSION##*.}"
 
-          sed -i 's/^GO_DEFAULT_VERSION:=1\.26$/GO_DEFAULT_VERSION:=1.27/' \
-            feeds/packages/lang/golang/golang-values.mk
+          sed -i \
+            -e "s/^GO_VERSION_PATCH:=.*/GO_VERSION_PATCH:=${GO_PATCH}/" \
+            -e "s|^PKG_HASH:=.*|PKG_HASH:=${GO_HASH}|" \
+            "$GO_RECIPE_FILE"
+
+          sed -i \
+            "s/^GO_DEFAULT_VERSION:=.*/GO_DEFAULT_VERSION:=${GO_MAJOR_MINOR}/" \
+            "$GO_VALUES_FILE"
 
           echo "Ricetta Go aggiornata:"
           grep -E '^(GO_VERSION_MAJOR_MINOR|GO_VERSION_PATCH|GO_VERSION_RC|PKG_HASH):=' \
-            feeds/packages/lang/golang/golang1.27/Makefile
+            "$GO_RECIPE_FILE"
 
           echo "Versione Go predefinita:"
-          grep -n 'GO_DEFAULT_VERSION' \
-            feeds/packages/lang/golang/golang-values.mk
+          grep -n 'GO_DEFAULT_VERSION' "$GO_VALUES_FILE"
 
       - name: Update cloudflared recipe
         working-directory: sdk
         env:
-          CF_VERSION: ${{ needs.check-upstream.outputs.version }}
+          CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
+          GO_MAJOR_MINOR: ${{ needs.resolve-toolchain.outputs.go_major_minor }}
         shell: bash
         run: |
           set -euo pipefail
-
-          if [[ ! "$CF_VERSION" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Versione cloudflared non valida: $CF_VERSION"
-            exit 1
-          fi
 
           curl --fail --location --retry 3 \
             "https://codeload.github.com/cloudflare/cloudflared/tar.gz/${CF_VERSION}" \
@@ -256,7 +382,7 @@ jobs:
             -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${CF_VERSION}/" \
             -e 's/^PKG_RELEASE:=.*/PKG_RELEASE:=1/' \
             -e "s|^PKG_HASH:=.*|PKG_HASH:=${CF_HASH}|" \
-            -e 's|^PKG_BUILD_DEPENDS:=.*|PKG_BUILD_DEPENDS:=golang1.27/host|' \
+            -e "s|^PKG_BUILD_DEPENDS:=.*|PKG_BUILD_DEPENDS:=golang${GO_MAJOR_MINOR}/host|" \
             feeds/packages/net/cloudflared/Makefile
 
           mkdir -p dl
@@ -306,6 +432,9 @@ jobs:
 
       - name: Verify Go toolchain selection
         working-directory: sdk
+        env:
+          GO_VERSION: ${{ needs.resolve-toolchain.outputs.go_version }}
+          GO_MAJOR_MINOR: ${{ needs.resolve-toolchain.outputs.go_major_minor }}
         shell: bash
         run: |
           set -euo pipefail
@@ -314,16 +443,11 @@ jobs:
           grep '^PKG_BUILD_DEPENDS:=' \
             feeds/packages/net/cloudflared/Makefile
 
-          echo "Ricetta Go installata:"
-          test -f package/feeds/packages/golang1.27/Makefile
-          grep -E '^(PKG_NAME|PKG_VERSION|PKG_RELEASE|PKG_HASH):=' \
-            package/feeds/packages/golang1.27/Makefile
-
-          echo "Compilazione Go 1.27 host:"
-          make package/golang1.27/host/compile V=s
+          echo "Compilazione Go ${GO_VERSION} host:"
+          make "package/golang${GO_MAJOR_MINOR}/host/compile" V=s
 
           GO_BIN="$(
-            find staging_dir/hostpkg/lib/go-1.27 \
+            find "staging_dir/hostpkg/lib/go-${GO_MAJOR_MINOR}" \
               -type f \
               -path '*/bin/go' \
               -print \
@@ -340,8 +464,8 @@ jobs:
               | sed -E 's/^go version go([0-9.]+).*/\1/'
           )"
 
-          if [[ "$ACTUAL" != "1.27.3" ]]; then
-            echo "Errore: atteso Go 1.27.3, trovato $ACTUAL"
+          if [[ "$ACTUAL" != "$GO_VERSION" ]]; then
+            echo "Errore: atteso Go ${GO_VERSION}, trovato $ACTUAL"
             exit 1
           fi
 
@@ -356,7 +480,8 @@ jobs:
       - name: Collect package
         shell: bash
         env:
-          CF_VERSION: ${{ needs.check-upstream.outputs.version }}
+          CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
+          OPENWRT_VERSION: ${{ needs.resolve-versions.outputs.openwrt_version }}
         run: |
           set -euo pipefail
 
@@ -374,7 +499,7 @@ jobs:
           cp "$APK" "feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}/"
 
       - name: Create APK repository index
-        working-directory: feed/releases/${{ env.OPENWRT_VERSION }}/${{ env.PACKAGE_ARCH }}
+        working-directory: feed/releases/${{ needs.resolve-versions.outputs.openwrt_version }}/${{ env.PACKAGE_ARCH }}
         env:
           APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
         shell: bash
@@ -416,14 +541,15 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          CF_VERSION: ${{ needs.check-upstream.outputs.version }}
+          CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
+          OPENWRT_VERSION: ${{ needs.resolve-versions.outputs.openwrt_version }}
         run: |
           set -euo pipefail
 
-          TAG="cloudflared-${CF_VERSION}"
+          TAG="cloudflared-${CF_VERSION}-openwrt-${OPENWRT_VERSION}"
 
           APK_PATH="$(
-            find feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH} \
+            find "feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}" \
               -type f \
               -name "cloudflared-${CF_VERSION}-*.apk" \
               | head -n1
@@ -435,8 +561,8 @@ jobs:
             echo "Release $TAG già esistente"
           else
             gh release create "$TAG" \
-              --title "cloudflared ${CF_VERSION}" \
-              --notes "Pacchetto OpenWrt 25.12 per rockchip/armv8 (aarch64_generic)." \
+              --title "cloudflared ${CF_VERSION} per OpenWrt ${OPENWRT_VERSION}" \
+              --notes "Pacchetto OpenWrt ${OPENWRT_VERSION} per rockchip/armv8 (aarch64_generic)." \
               "$APK_PATH"
           fi
 
@@ -456,7 +582,7 @@ jobs:
 
   deploy:
     needs: build
-    if: github.event_name == 'workflow_dispatch' || needs.check-upstream.outputs.should_build == 'true'
+    if: needs.resolve-versions.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
     environment:
       name: feed
