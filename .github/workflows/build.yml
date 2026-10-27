@@ -25,7 +25,6 @@ env:
   OPENWRT_VERSION: "25.12.6"
   TARGET: "rockchip/armv8"
   PACKAGE_ARCH: "aarch64_generic"
-  FEED_URL: "https://alanb2.github.io/owrt-cloudflared"
 
 jobs:
   check-upstream:
@@ -71,10 +70,8 @@ jobs:
           fi
 
   build:
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      needs.check-upstream.outputs.should_build == 'true'
     needs: check-upstream
+    if: github.event_name == 'workflow_dispatch' || needs.check-upstream.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
 
@@ -105,9 +102,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/sdk-download"
           cd "$RUNNER_TEMP/sdk-download"
 
-          curl --fail --location --retry 3 \
-            "$BASE/sha256sums" \
-            -o sha256sums
+          curl --fail --location --retry 3 "$BASE/sha256sums" -o sha256sums
 
           SDK_FILE="$(
             awk '{print $2}' sha256sums \
@@ -118,17 +113,12 @@ jobs:
           test -n "$SDK_FILE"
           test "$(printf '%s\n' "$SDK_FILE" | wc -l)" -eq 1
 
-          curl --fail --location --retry 3 \
-            "$BASE/$SDK_FILE" \
-            -o "$SDK_FILE"
+          curl --fail --location --retry 3 "$BASE/$SDK_FILE" -o "$SDK_FILE"
 
           sha256sum --check --ignore-missing sha256sums
 
           mkdir -p "$GITHUB_WORKSPACE/sdk"
-
-          tar -xf "$SDK_FILE" \
-            -C "$GITHUB_WORKSPACE/sdk" \
-            --strip-components=1
+          tar -xf "$SDK_FILE" -C "$GITHUB_WORKSPACE/sdk" --strip-components=1
 
       - name: Prepare OpenWrt feeds
         working-directory: sdk
@@ -142,7 +132,7 @@ jobs:
           test -f feeds/packages/net/cloudflared/Makefile
           test -f feeds/packages/lang/golang/golang/Makefile
 
-      - name: Import current Go 1.27 infrastructure
+      - name: Import Go 1.27 infrastructure
         working-directory: sdk
         shell: bash
         run: |
@@ -156,16 +146,13 @@ jobs:
 
           rm -rf "$RUNNER_TEMP/packages-master/.git"
 
-          cp -a \
-            "$RUNNER_TEMP/packages-master/lang/golang" \
+          cp -a "$RUNNER_TEMP/packages-master/lang/golang" \
             feeds/packages/lang/golang
 
           test -f feeds/packages/lang/golang/golang1.27/Makefile
 
-      - name: Update Go recipe to required version
+      - name: Update Go recipe
         working-directory: sdk
-        env:
-          GO_VERSION: "1.27.3"
         shell: bash
         run: |
           set -euo pipefail
@@ -259,7 +246,6 @@ for release in data:
           PY
 
           mkdir -p dl
-
           cp "$RUNNER_TEMP/cloudflared-source.tar.gz" \
             "dl/cloudflared-${CF_VERSION}.tar.gz"
 
@@ -299,24 +285,23 @@ for release in data:
 
       - name: Collect package
         shell: bash
+        env:
+          CF_VERSION: ${{ needs.check-upstream.outputs.version }}
         run: |
           set -euo pipefail
 
-          mkdir -p feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}
+          mkdir -p "feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}"
 
           APK="$(
             find sdk/bin/packages/${PACKAGE_ARCH} \
               -type f \
-              -name "cloudflared-${{ needs.check-upstream.outputs.version }}-*.apk" \
+              -name "cloudflared-${CF_VERSION}-*.apk" \
               | head -n1
           )"
 
           test -n "$APK"
 
-          cp "$APK" \
-            "feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}/"
-
-          echo "$APK" > "$RUNNER_TEMP/cloudflared-apk-path"
+          cp "$APK" "feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}/"
 
       - name: Create APK repository index
         working-directory: feed/releases/${{ env.OPENWRT_VERSION }}/${{ env.PACKAGE_ARCH }}
@@ -338,18 +323,25 @@ for release in data:
             ./*.apk
 
           test -s packages.adb
-
           sha256sum ./*.apk packages.adb > sha256sums
 
       - name: Publish GitHub release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           CF_VERSION: ${{ needs.check-upstream.outputs.version }}
-        shell: bash
         run: |
           set -euo pipefail
 
           TAG="cloudflared-${CF_VERSION}"
+          APK_PATH="$(
+            find feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH} \
+              -type f \
+              -name "cloudflared-${CF_VERSION}-*.apk" \
+              | head -n1
+          )"
+
+          test -n "$APK_PATH"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG già esistente"
@@ -357,7 +349,7 @@ for release in data:
             gh release create "$TAG" \
               --title "cloudflared ${CF_VERSION}" \
               --notes "Pacchetto OpenWrt 25.12 per rockchip/armv8 (aarch64_generic)." \
-              "feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}/cloudflared-${CF_VERSION}-*.apk"
+              "$APK_PATH"
           fi
 
       - name: Upload Pages artifact
@@ -366,12 +358,8 @@ for release in data:
           path: feed
 
   deploy:
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      needs.check-upstream.outputs.should_build == 'true'
-    needs:
-      - check-upstream
-      - build
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || needs.check-upstream.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
     environment:
       name: feed
