@@ -25,6 +25,7 @@ env:
   OPENWRT_VERSION: "25.12.6"
   TARGET: "rockchip/armv8"
   PACKAGE_ARCH: "aarch64_generic"
+  FEED_URL: "https://alanb2.github.io/owrt-cloudflared"
 
 jobs:
   check-upstream:
@@ -157,38 +158,32 @@ jobs:
         run: |
           set -euo pipefail
 
-          GO_META="$(
-            curl --fail --location --retry 3 \
-              'https://go.dev/dl/?mode=json&include=all'
-          )"
+          GO_META_FILE="$RUNNER_TEMP/go-releases.json"
+
+          curl --fail --location --retry 3 \
+            'https://go.dev/dl/?mode=json&include=all' \
+            -o "$GO_META_FILE"
 
           GO_HASH="$(
-            printf '%s' "$GO_META" \
-              | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-for release in data:
-    if release["version"] == "go1.27.3":
-        for file in release["files"]:
-            if file["filename"] == "go1.27.3.src.tar.gz":
-                print(file["sha256"])
-                break
-'
+            python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); print(next(f["sha256"] for r in data if r["version"]=="go1.27.3" for f in r["files"] if f["filename"]=="go1.27.3.src.tar.gz"))' \
+              "$GO_META_FILE"
           )"
 
           test -n "$GO_HASH"
 
           sed -i \
             -e 's/^GO_VERSION_PATCH:=1$/GO_VERSION_PATCH:=3/' \
-            -e "s/^PKG_HASH:=.*/PKG_HASH:=${GO_HASH}/" \
+            -e "s|^PKG_HASH:=.*|PKG_HASH:=${GO_HASH}|" \
             feeds/packages/lang/golang/golang1.27/Makefile
 
           sed -i 's/^GO_DEFAULT_VERSION:=1\.26$/GO_DEFAULT_VERSION:=1.27/' \
             feeds/packages/lang/golang/golang-values.mk
 
+          echo "Ricetta Go aggiornata:"
           grep -E '^(GO_VERSION_MAJOR_MINOR|GO_VERSION_PATCH|GO_VERSION_RC|PKG_HASH):=' \
             feeds/packages/lang/golang/golang1.27/Makefile
 
+          echo "Versione Go predefinita:"
           grep -n 'GO_DEFAULT_VERSION' \
             feeds/packages/lang/golang/golang-values.mk
 
@@ -213,42 +208,19 @@ for release in data:
             sha256sum "$RUNNER_TEMP/cloudflared-source.tar.gz" \
               | awk '{print $1}'
           )"
-          export CF_HASH
 
-          python3 - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-
-          path = Path("feeds/packages/net/cloudflared/Makefile")
-          text = path.read_text()
-
-          replacements = {
-              "PKG_VERSION": os.environ["CF_VERSION"],
-              "PKG_RELEASE": "1",
-              "PKG_HASH": os.environ["CF_HASH"],
-          }
-
-          for key, value in replacements.items():
-              text, count = re.subn(
-                  rf"^{key}:=.*$",
-                  f"{key}:={value}",
-                  text,
-                  flags=re.MULTILINE,
-              )
-              if count != 1:
-                  raise RuntimeError(
-                      f"Campo inatteso nella ricetta: {key}; "
-                      f"occorrenze trovate: {count}"
-                  )
-
-          path.write_text(text)
-          PY
+          sed -i \
+            -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${CF_VERSION}/" \
+            -e 's/^PKG_RELEASE:=.*/PKG_RELEASE:=1/' \
+            -e "s|^PKG_HASH:=.*|PKG_HASH:=${CF_HASH}|" \
+            feeds/packages/net/cloudflared/Makefile
 
           mkdir -p dl
+
           cp "$RUNNER_TEMP/cloudflared-source.tar.gz" \
             "dl/cloudflared-${CF_VERSION}.tar.gz"
 
+          echo "Ricetta cloudflared aggiornata:"
           grep -E '^(PKG_VERSION|PKG_RELEASE|PKG_HASH|PKG_BUILD_DEPENDS):=' \
             feeds/packages/net/cloudflared/Makefile
 
@@ -334,6 +306,7 @@ for release in data:
           set -euo pipefail
 
           TAG="cloudflared-${CF_VERSION}"
+
           APK_PATH="$(
             find feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH} \
               -type f \
