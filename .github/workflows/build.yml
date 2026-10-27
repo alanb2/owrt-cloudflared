@@ -104,12 +104,19 @@ jobs:
             "$APK_BASE/$APK_FILE" \
             -o "$APK_FILE"
 
-          tar -xzf "$APK_FILE"
+          tar -xzf "$APK_FILE" || true
 
-          test -f usr/bin/apk.static
+          APK_STATIC="$(
+            find . -type f \
+              \( -name 'apk.static' -o -name 'apk' \) \
+              -print \
+              | head -n1
+          )"
+
+          test -n "$APK_STATIC"
 
           mkdir -p "$RUNNER_TEMP/bin"
-          cp usr/bin/apk.static "$RUNNER_TEMP/bin/apk"
+          cp "$APK_STATIC" "$RUNNER_TEMP/bin/apk"
           chmod +x "$RUNNER_TEMP/bin/apk"
 
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
