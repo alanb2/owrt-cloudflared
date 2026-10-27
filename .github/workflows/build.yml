@@ -1,0 +1,383 @@
+name: Build and publish cloudflared
+
+on:
+  workflow_dispatch:
+    inputs:
+      cloudflared_version:
+        description: "Versione cloudflared, senza prefisso v"
+        required: true
+        default: "2026.10.4"
+        type: string
+
+  schedule:
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  OPENWRT_VERSION: "25.12.6"
+  TARGET: "rockchip/armv8"
+  PACKAGE_ARCH: "aarch64_generic"
+  FEED_URL: "https://alanb2.github.io/owrt-cloudflared"
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      should_build: ${{ steps.version.outputs.should_build }}
+
+    steps:
+      - name: Check latest stable cloudflared release
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          LATEST="$(
+            gh api repos/cloudflare/cloudflared/releases/latest \
+              --jq '.tag_name' \
+              | sed 's/^v//'
+          )"
+
+          if [[ ! "$LATEST" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Versione upstream non valida: $LATEST"
+            exit 1
+          fi
+
+          LAST_BUILT="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases" \
+              --jq '[.[].tag_name | select(startswith("cloudflared-"))][0] // ""' \
+              | sed 's/^cloudflared-//'
+          )"
+
+          if [[ "$LATEST" == "$LAST_BUILT" ]]; then
+            echo "Nessuna nuova release: $LATEST"
+            echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Nuova release rilevata: $LATEST"
+            echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      needs.check-upstream.outputs.should_build == 'true'
+    needs: check-upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git \
+            libncurses-dev libssl-dev \
+            python3 python3-dev python3-setuptools python3-pyelftools \
+            rsync unzip zlib1g-dev file wget curl zstd swig apk-tools
+
+      - name: Download and verify OpenWrt SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET}"
+
+          mkdir -p "$RUNNER_TEMP/sdk-download"
+          cd "$RUNNER_TEMP/sdk-download"
+
+          curl --fail --location --retry 3 \
+            "$BASE/sha256sums" \
+            -o sha256sums
+
+          SDK_FILE="$(
+            awk '{print $2}' sha256sums \
+              | sed 's/^\*//' \
+              | grep -E "^openwrt-sdk-${OPENWRT_VERSION}-rockchip-armv8_.*Linux-x86_64\.tar\.(xz|zst)$"
+          )"
+
+          test -n "$SDK_FILE"
+          test "$(printf '%s\n' "$SDK_FILE" | wc -l)" -eq 1
+
+          curl --fail --location --retry 3 \
+            "$BASE/$SDK_FILE" \
+            -o "$SDK_FILE"
+
+          sha256sum --check --ignore-missing sha256sums
+
+          mkdir -p "$GITHUB_WORKSPACE/sdk"
+
+          tar -xf "$SDK_FILE" \
+            -C "$GITHUB_WORKSPACE/sdk" \
+            --strip-components=1
+
+      - name: Prepare OpenWrt feeds
+        working-directory: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install cloudflared
+
+          test -f feeds/packages/net/cloudflared/Makefile
+          test -f feeds/packages/lang/golang/golang/Makefile
+
+      - name: Import current Go 1.27 infrastructure
+        working-directory: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf feeds/packages/lang/golang
+
+          git clone --depth 1 \
+            https://github.com/openwrt/packages.git \
+            "$RUNNER_TEMP/packages-master"
+
+          rm -rf "$RUNNER_TEMP/packages-master/.git"
+
+          cp -a \
+            "$RUNNER_TEMP/packages-master/lang/golang" \
+            feeds/packages/lang/golang
+
+          test -f feeds/packages/lang/golang/golang1.27/Makefile
+
+      - name: Update Go recipe to required version
+        working-directory: sdk
+        env:
+          GO_VERSION: "1.27.3"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GO_META="$(
+            curl --fail --location --retry 3 \
+              'https://go.dev/dl/?mode=json&include=all'
+          )"
+
+          GO_HASH="$(
+            printf '%s' "$GO_META" \
+              | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+for release in data:
+    if release["version"] == "go1.27.3":
+        for file in release["files"]:
+            if file["filename"] == "go1.27.3.src.tar.gz":
+                print(file["sha256"])
+                break
+'
+          )"
+
+          test -n "$GO_HASH"
+
+          sed -i \
+            -e 's/^GO_VERSION_PATCH:=1$/GO_VERSION_PATCH:=3/' \
+            -e "s/^PKG_HASH:=.*/PKG_HASH:=${GO_HASH}/" \
+            feeds/packages/lang/golang/golang1.27/Makefile
+
+          sed -i 's/^GO_DEFAULT_VERSION:=1\.26$/GO_DEFAULT_VERSION:=1.27/' \
+            feeds/packages/lang/golang/golang-values.mk
+
+          grep -E '^(GO_VERSION_MAJOR_MINOR|GO_VERSION_PATCH|GO_VERSION_RC|PKG_HASH):=' \
+            feeds/packages/lang/golang/golang1.27/Makefile
+
+          grep -n 'GO_DEFAULT_VERSION' \
+            feeds/packages/lang/golang/golang-values.mk
+
+      - name: Update cloudflared recipe
+        working-directory: sdk
+        env:
+          CF_VERSION: ${{ needs.check-upstream.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$CF_VERSION" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Versione cloudflared non valida: $CF_VERSION"
+            exit 1
+          fi
+
+          curl --fail --location --retry 3 \
+            "https://codeload.github.com/cloudflare/cloudflared/tar.gz/${CF_VERSION}" \
+            -o "$RUNNER_TEMP/cloudflared-source.tar.gz"
+
+          CF_HASH="$(
+            sha256sum "$RUNNER_TEMP/cloudflared-source.tar.gz" \
+              | awk '{print $1}'
+          )"
+          export CF_HASH
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("feeds/packages/net/cloudflared/Makefile")
+          text = path.read_text()
+
+          replacements = {
+              "PKG_VERSION": os.environ["CF_VERSION"],
+              "PKG_RELEASE": "1",
+              "PKG_HASH": os.environ["CF_HASH"],
+          }
+
+          for key, value in replacements.items():
+              text, count = re.subn(
+                  rf"^{key}:=.*$",
+                  f"{key}:={value}",
+                  text,
+                  flags=re.MULTILINE,
+              )
+              if count != 1:
+                  raise RuntimeError(
+                      f"Campo inatteso nella ricetta: {key}; "
+                      f"occorrenze trovate: {count}"
+                  )
+
+          path.write_text(text)
+          PY
+
+          mkdir -p dl
+
+          cp "$RUNNER_TEMP/cloudflared-source.tar.gz" \
+            "dl/cloudflared-${CF_VERSION}.tar.gz"
+
+          grep -E '^(PKG_VERSION|PKG_RELEASE|PKG_HASH|PKG_BUILD_DEPENDS):=' \
+            feeds/packages/net/cloudflared/Makefile
+
+      - name: Configure SDK
+        working-directory: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          touch .config
+
+          sed -i -E \
+            '/^(CONFIG_ALL|CONFIG_ALL_NONSHARED|CONFIG_ALL_KMODS|CONFIG_PACKAGE_cloudflared)=/d; /^# (CONFIG_ALL|CONFIG_ALL_NONSHARED|CONFIG_ALL_KMODS|CONFIG_PACKAGE_cloudflared) is not set$/d' \
+            .config
+
+          cat >> .config <<'EOF'
+          # CONFIG_ALL is not set
+          # CONFIG_ALL_NONSHARED is not set
+          # CONFIG_ALL_KMODS is not set
+          CONFIG_PACKAGE_cloudflared=m
+          EOF
+
+          make defconfig
+
+          grep -qx 'CONFIG_PACKAGE_cloudflared=m' .config
+
+      - name: Build cloudflared
+        working-directory: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          make -j2 package/cloudflared/compile V=s
+
+      - name: Collect package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}
+
+          APK="$(
+            find sdk/bin/packages/${PACKAGE_ARCH} \
+              -type f \
+              -name "cloudflared-${{ needs.check-upstream.outputs.version }}-*.apk" \
+              | head -n1
+          )"
+
+          test -n "$APK"
+
+          cp "$APK" \
+            "feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}/"
+
+          echo "$APK" > "$RUNNER_TEMP/cloudflared-apk-path"
+
+      - name: Create APK repository index
+        working-directory: feed/releases/${{ env.OPENWRT_VERSION }}/${{ env.PACKAGE_ARCH }}
+        env:
+          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/apk-keys"
+          printf '%s\n' "$APK_SIGN_KEY" \
+            > "$RUNNER_TEMP/apk-keys/owrt-cloudflared.key"
+          chmod 600 "$RUNNER_TEMP/apk-keys/owrt-cloudflared.key"
+
+          apk mkndx \
+            --allow-untrusted \
+            --sign "$RUNNER_TEMP/apk-keys/owrt-cloudflared.key" \
+            --output packages.adb \
+            ./*.apk
+
+          test -s packages.adb
+
+          sha256sum ./*.apk packages.adb > sha256sums
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CF_VERSION: ${{ needs.check-upstream.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="cloudflared-${CF_VERSION}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG già esistente"
+          else
+            gh release create "$TAG" \
+              --title "cloudflared ${CF_VERSION}" \
+              --notes "Pacchetto OpenWrt 25.12 per rockchip/armv8 (aarch64_generic)." \
+              "feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}/cloudflared-${CF_VERSION}-*.apk"
+          fi
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: feed
+
+  deploy:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      needs.check-upstream.outputs.should_build == 'true'
+    needs:
+      - check-upstream
+      - build
+    runs-on: ubuntu-24.04
+    environment:
+      name: feed
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
