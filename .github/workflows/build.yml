@@ -6,7 +6,7 @@ on:
       cloudflared_version:
         description: "Versione cloudflared, senza prefisso v"
         required: true
-        default: "2026.10.4"
+        default: "2026.10.5"
         type: string
 
   schedule:
@@ -243,6 +243,7 @@ jobs:
             -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${CF_VERSION}/" \
             -e 's/^PKG_RELEASE:=.*/PKG_RELEASE:=1/' \
             -e "s|^PKG_HASH:=.*|PKG_HASH:=${CF_HASH}|" \
+            -e 's|^PKG_BUILD_DEPENDS:=.*|PKG_BUILD_DEPENDS:=golang1.27/host|' \
             feeds/packages/net/cloudflared/Makefile
 
           mkdir -p dl
@@ -253,6 +254,19 @@ jobs:
           echo "Ricetta cloudflared aggiornata:"
           grep -E '^(PKG_VERSION|PKG_RELEASE|PKG_HASH|PKG_BUILD_DEPENDS):=' \
             feeds/packages/net/cloudflared/Makefile
+
+      - name: Remove stale Go artifacts
+        working-directory: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf \
+            build_dir/hostpkg \
+            staging_dir/hostpkg \
+            tmp/.host*
+
+          mkdir -p build_dir/hostpkg staging_dir/hostpkg
 
       - name: Configure SDK
         working-directory: sdk
@@ -276,6 +290,46 @@ jobs:
           make defconfig
 
           grep -qx 'CONFIG_PACKAGE_cloudflared=m' .config
+
+      - name: Verify Go toolchain selection
+        working-directory: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Dipendenza dichiarata da cloudflared:"
+          grep '^PKG_BUILD_DEPENDS:=' \
+            feeds/packages/net/cloudflared/Makefile
+
+          echo "Ricetta Go 1.27:"
+          grep -E '^(GO_VERSION_MAJOR_MINOR|GO_VERSION_PATCH|GO_VERSION_RC|PKG_HASH):=' \
+            feeds/packages/lang/golang/golang1.27/Makefile
+
+          echo "Compilazione Go 1.27 host:"
+          make package/golang1.27/host/compile V=s
+
+          GO_BIN="$(
+            find staging_dir/hostpkg/lib/go-1.27 \
+              -type f \
+              -path '*/bin/go' \
+              -print \
+              | head -n1
+          )"
+
+          test -n "$GO_BIN"
+
+          echo "Go selezionato:"
+          "$GO_BIN" version
+
+          ACTUAL="$(
+            "$GO_BIN" version \
+              | sed -E 's/^go version go([0-9.]+).*/\1/'
+          )"
+
+          if [[ "$ACTUAL" != "1.27.3" ]]; then
+            echo "Errore: atteso Go 1.27.3, trovato $ACTUAL"
+            exit 1
+          fi
 
       - name: Build cloudflared
         working-directory: sdk
@@ -308,7 +362,7 @@ jobs:
       - name: Create APK repository index
         working-directory: feed/releases/${{ env.OPENWRT_VERSION }}/${{ env.PACKAGE_ARCH }}
         env:
-          MAFNET_APK_SIGN_KEY: ${{ secrets.MAFNET_APK_SIGN_KEY }}
+          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
         shell: bash
         run: |
           set -euo pipefail
@@ -319,14 +373,14 @@ jobs:
 
           mkdir -p "$RUNNER_TEMP/apk-keys"
 
-          printf '%s\n' "$MAFNET_APK_SIGN_KEY" \
-            > "$RUNNER_TEMP/apk-keys/mafnet-openwrt.key"
+          printf '%s\n' "$APK_SIGN_KEY" \
+            > "$RUNNER_TEMP/apk-keys/owrt-cloudflared.key"
 
-          chmod 600 "$RUNNER_TEMP/apk-keys/mafnet-openwrt.key"
+          chmod 600 "$RUNNER_TEMP/apk-keys/owrt-cloudflared.key"
 
           "$APK_BIN" mkndx \
             --allow-untrusted \
-            --sign "$RUNNER_TEMP/apk-keys/mafnet-openwrt.key" \
+            --sign "$RUNNER_TEMP/apk-keys/owrt-cloudflared.key" \
             --output packages.adb \
             ./*.apk
 
