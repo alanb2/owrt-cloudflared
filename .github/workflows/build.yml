@@ -79,7 +79,7 @@ jobs:
       contents: write
       pages: write
       id-token: write
-      
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -439,6 +439,15 @@ jobs:
               --notes "Pacchetto OpenWrt 25.12 per rockchip/armv8 (aarch64_generic)." \
               "$APK_PATH"
           fi
+
+      - name: Copy public key to Pages feed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f owrt-cloudflared.pem
+
+          cp owrt-cloudflared.pem feed/owrt-cloudflared.pem
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
