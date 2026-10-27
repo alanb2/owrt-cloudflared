@@ -75,7 +75,11 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || needs.check-upstream.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+      
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
