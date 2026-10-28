@@ -87,7 +87,7 @@ apk add cloudflared
 Per aggiornarlo:
 
 ```sh
-apk upgrade cloudflared
+apk add -u cloudflared
 ```
 
 Poi verifica la versione:
