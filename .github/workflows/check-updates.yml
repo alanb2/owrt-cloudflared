@@ -1,0 +1,114 @@
+name: Check cloudflared updates
+
+on:
+  schedule:
+    - cron: "17 4,10,16,22 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Ricompila anche senza aggiornamenti"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflared-update-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      cloudflared_version: ${{ steps.versions.outputs.cloudflared_version }}
+      openwrt_version: ${{ steps.versions.outputs.openwrt_version }}
+      should_build: ${{ steps.versions.outputs.should_build }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Resolve versions and check published state
+        id: versions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          CF_VERSION="$(gh api repos/cloudflare/cloudflared/releases/latest --jq '.tag_name' | sed 's/^v//')"
+          OPENWRT_VERSION="$(curl --fail --location --retry 3 'https://downloads.openwrt.org/.versions.json' | python3 -c 'import json,sys; print(json.load(sys.stdin)["stable_version"])')"
+          [[ "$CF_VERSION" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]]
+          [[ "$OPENWRT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          export CF_VERSION OPENWRT_VERSION
+          STATE_FILE="$RUNNER_TEMP/publication.json"
+          export STATE_FILE
+          if git ls-remote --exit-code --heads origin feed-state > "$RUNNER_TEMP/feed-ref"; then
+            git fetch --depth=1 origin refs/heads/feed-state
+            META="metadata/${OPENWRT_VERSION}/aarch64_generic.json"
+            if git cat-file -e "FETCH_HEAD:$META"; then
+              git show "FETCH_HEAD:$META" > "$STATE_FILE"
+            fi
+          else
+            status=$?
+            if [[ "$status" -ne 2 ]]; then exit "$status"; fi
+          fi
+          SHOULD_BUILD="$(python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          expected = {"cloudflared_version": os.environ["CF_VERSION"],
+                      "openwrt_version": os.environ["OPENWRT_VERSION"],
+                      "target": "rockchip/armv8", "package_arch": "aarch64_generic"}
+          path = Path(os.environ["STATE_FILE"])
+          current = json.loads(path.read_text()) if path.exists() else {}
+          rebuild = os.environ.get("FORCE", "").lower() == "true" or any(current.get(k) != v for k, v in expected.items())
+          print("true" if rebuild else "false")
+          PY
+          )"
+          echo "cloudflared_version=$CF_VERSION" >> "$GITHUB_OUTPUT"
+          echo "openwrt_version=$OPENWRT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Controllo aggiornamenti"
+            echo "- cloudflared: $CF_VERSION"
+            echo "- OpenWrt: $OPENWRT_VERSION"
+            echo "- Compilazione necessaria: $SHOULD_BUILD"
+            echo "- Evento: $GITHUB_EVENT_NAME"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep main active after 30 days without commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOW="$(date -u +%s)"
+          LAST="$(git log -1 --format=%ct)"
+          if (( NOW - LAST < 30 * 24 * 60 * 60 )); then
+            echo "Keepalive non necessario."
+            exit 0
+          fi
+          mkdir -p .github
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > .github/keepalive.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/keepalive.txt
+          git commit -m "chore: scheduled workflow keepalive"
+          git push origin "HEAD:refs/heads/${{ github.event.repository.default_branch }}"
+
+  call-build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/build.yml
+    with:
+      cloudflared_version: ${{ needs.check.outputs.cloudflared_version }}
+      openwrt_version: ${{ needs.check.outputs.openwrt_version }}
+    secrets:
+      APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}

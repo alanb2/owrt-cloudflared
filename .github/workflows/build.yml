@@ -4,18 +4,24 @@ on:
   workflow_dispatch:
     inputs:
       cloudflared_version:
-        description: "Versione cloudflared, senza prefisso v"
-        required: true
-        default: "2026.10.5"
+        description: "Versione cloudflared; vuoto = ultima release"
+        required: false
         type: string
       openwrt_version:
-        description: "Versione OpenWrt per cui compilare"
-        required: true
-        default: "25.12.6"
+        description: "Versione OpenWrt; vuoto = ultima stabile"
+        required: false
         type: string
-
-  schedule:
-    - cron: "17 4 * * *"
+  workflow_call:
+    inputs:
+      cloudflared_version:
+        required: true
+        type: string
+      openwrt_version:
+        required: true
+        type: string
+    secrets:
+      APK_SIGN_KEY:
+        required: true
 
 permissions:
   contents: read
@@ -85,23 +91,7 @@ jobs:
             exit 1
           fi
 
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            SHOULD_BUILD=true
-          else
-            LAST_BUILT="$(
-              gh api "repos/${GITHUB_REPOSITORY}/releases" \
-                --jq '[.[].tag_name | select(startswith("cloudflared-"))][0] // ""' \
-                | sed 's/^cloudflared-//'
-            )"
-
-            if [[ "$CF_VERSION" == "$LAST_BUILT" ]]; then
-              echo "Nessuna nuova release: $CF_VERSION"
-              SHOULD_BUILD=false
-            else
-              echo "Nuova release rilevata: $CF_VERSION"
-              SHOULD_BUILD=true
-            fi
-          fi
+          SHOULD_BUILD=true
 
           echo "cloudflared_version=$CF_VERSION" >> "$GITHUB_OUTPUT"
           echo "openwrt_version=$OPENWRT_VERSION" >> "$GITHUB_OUTPUT"
@@ -143,12 +133,12 @@ jobs:
 
           GO_RELEASES="$(
             curl --fail --location --retry 3 \
-              'https://go.dev/dl/?mode=json'
+              'https://go.dev/dl/?mode=json&include=all'
           )"
 
           GO_LATEST_PATCH="$(
             printf '%s' "$GO_RELEASES" \
-              | python3 -c 'import json,sys; data=json.load(sys.stdin); series=sys.argv[1]; versions=[r["version"].removeprefix("go") for r in data if r["version"].removeprefix("go").startswith(series+".")]; print(max(versions, key=lambda value: tuple(map(int, value.split(".")))))' \
+              | python3 -c 'import json,sys; data=json.load(sys.stdin); series=sys.argv[1]; versions=[r["version"].removeprefix("go") for r in data if r.get("stable") and r["version"].removeprefix("go").startswith(series+".")]; print(max(versions, key=lambda value: tuple(map(int, value.split(".")))))' \
                 "$GO_MAJOR_MINOR"
           )"
 
@@ -477,6 +467,20 @@ jobs:
 
           make -j2 package/cloudflared/compile V=s
 
+      - name: Restore previously published feeds
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p feed
+          if git ls-remote --exit-code --heads origin feed-state > "$RUNNER_TEMP/feed-ref"; then
+            git fetch --depth=1 origin refs/heads/feed-state
+            git archive FETCH_HEAD | tar -x -C feed
+          else
+            status=$?
+            if [[ "$status" -ne 2 ]]; then exit "$status"; fi
+            echo "Primo avvio: nessun archivio feed-state disponibile."
+          fi
+
       - name: Collect current package only
         shell: bash
         env:
@@ -573,7 +577,7 @@ jobs:
           test -n "$APK_PATH"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG già esistente"
+            gh release upload "$TAG" "$APK_PATH" --clobber
           else
             gh release create "$TAG" \
               --title "cloudflared ${CF_VERSION} per OpenWrt ${OPENWRT_VERSION}" \
@@ -590,13 +594,43 @@ jobs:
 
           cp owrt-cloudflared.pem feed/owrt-cloudflared.pem
 
+      - name: Prepare publication metadata
+        shell: bash
+        env:
+          CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
+          OPENWRT_VERSION: ${{ needs.resolve-versions.outputs.openwrt_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "feed/metadata/${OPENWRT_VERSION}"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          data = {"cloudflared_version": os.environ["CF_VERSION"],
+                  "openwrt_version": os.environ["OPENWRT_VERSION"],
+                  "target": os.environ["TARGET"], "package_arch": os.environ["PACKAGE_ARCH"]}
+          path = Path("feed/metadata") / data["openwrt_version"] / (data["package_arch"] + ".json")
+          path.write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+      - name: Save feed snapshot for post-deploy persistence
+        uses: actions/upload-artifact@v4
+        with:
+          name: feed-snapshot
+          path: feed/
+          retention-days: 7
+          if-no-files-found: error
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: feed
 
   deploy:
-    needs: build
+    needs: [resolve-versions, build]
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
     if: needs.resolve-versions.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
     environment:
@@ -607,3 +641,36 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+      - name: Checkout repository for feed state
+        uses: actions/checkout@v4
+        with:
+          path: feed-state-repo
+
+      - name: Download deployed feed snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: feed-snapshot
+          path: ${{ runner.temp }}/published-feed
+
+      - name: Persist state after successful Pages deploy
+        working-directory: feed-state-repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin feed-state > "$RUNNER_TEMP/state-ref"; then
+            git fetch --depth=1 origin refs/heads/feed-state
+            git checkout -B feed-state FETCH_HEAD
+          else
+            status=$?
+            if [[ "$status" -ne 2 ]]; then exit "$status"; fi
+            git checkout --orphan feed-state
+            git rm -rf .
+          fi
+          rsync -a --delete --exclude='.git' "$RUNNER_TEMP/published-feed/" ./
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Persist deployed cloudflared feed"
+            git push origin HEAD:refs/heads/feed-state
+          fi
