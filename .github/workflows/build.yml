@@ -621,7 +621,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: feed
 
@@ -640,7 +640,7 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v6
+        uses: actions/deploy-pages@v4
       - name: Checkout repository for feed state
         uses: actions/checkout@v6
         with:
