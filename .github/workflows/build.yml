@@ -44,6 +44,7 @@ jobs:
       cloudflared_version: ${{ steps.versions.outputs.cloudflared_version }}
       openwrt_version: ${{ steps.versions.outputs.openwrt_version }}
       should_build: ${{ steps.versions.outputs.should_build }}
+      package_release: ${{ steps.versions.outputs.package_release }}
 
     steps:
       - name: Resolve cloudflared and OpenWrt versions
@@ -92,10 +93,29 @@ jobs:
           fi
 
           SHOULD_BUILD=true
+          PACKAGE_RELEASE=1
+
+          if git ls-remote --exit-code --heads origin feed-state > "$RUNNER_TEMP/feed-ref"; then
+            git fetch --depth=1 origin refs/heads/feed-state
+            META="metadata/${OPENWRT_VERSION}/${PACKAGE_ARCH}.json"
+            if git cat-file -e "FETCH_HEAD:$META" 2>/dev/null; then
+              CURRENT_RELEASE="$(
+                git show "FETCH_HEAD:$META" \
+                  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("package_release", 0))'
+              )"
+              if [[ "$CURRENT_RELEASE" =~ ^[0-9]+$ ]]; then
+                PACKAGE_RELEASE="$CURRENT_RELEASE"
+              fi
+            fi
+          else
+            status=$?
+            if [[ "$status" -ne 2 ]]; then exit "$status"; fi
+          fi
 
           echo "cloudflared_version=$CF_VERSION" >> "$GITHUB_OUTPUT"
           echo "openwrt_version=$OPENWRT_VERSION" >> "$GITHUB_OUTPUT"
           echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          echo "package_release=$PACKAGE_RELEASE" >> "$GITHUB_OUTPUT"
 
   resolve-toolchain:
     needs: resolve-versions
@@ -354,6 +374,7 @@ jobs:
         working-directory: sdk
         env:
           CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
+          PACKAGE_RELEASE: ${{ needs.resolve-versions.outputs.package_release }}
           GO_MAJOR_MINOR: ${{ needs.resolve-toolchain.outputs.go_major_minor }}
         shell: bash
         run: |
@@ -370,7 +391,7 @@ jobs:
 
           sed -i \
             -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${CF_VERSION}/" \
-            -e 's/^PKG_RELEASE:=.*/PKG_RELEASE:=1/' \
+            -e "s/^PKG_RELEASE:=.*/PKG_RELEASE:=\${PACKAGE_RELEASE}/" \
             -e "s|^PKG_HASH:=.*|PKG_HASH:=${CF_HASH}|" \
             -e "s|^PKG_BUILD_DEPENDS:=.*|PKG_BUILD_DEPENDS:=golang${GO_MAJOR_MINOR}/host|" \
             feeds/packages/net/cloudflared/Makefile
@@ -383,6 +404,64 @@ jobs:
           echo "Ricetta cloudflared aggiornata:"
           grep -E '^(PKG_VERSION|PKG_RELEASE|PKG_HASH|PKG_BUILD_DEPENDS):=' \
             feeds/packages/net/cloudflared/Makefile
+
+      - name: Inspect cloudflared packaging hooks
+        working-directory: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RECIPE="feeds/packages/net/cloudflared/Makefile"
+
+          echo "### Hook di packaging cloudflared"
+          grep -nE '^(define Package/cloudflared/(postinst|prerm|conffiles)|\$\(eval \$\(call (GoBinPackage|BuildPackage)' "$RECIPE" || true
+
+          if grep -q '^define Package/cloudflared/postinst' "$RECIPE"; then
+            echo "Errore: la ricetta contiene già un postinst specifico."
+            exit 1
+          fi
+
+      - name: Add restart-on-upgrade hook
+        working-directory: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RECIPE="feeds/packages/net/cloudflared/Makefile"
+
+          if grep -q '^define Package/cloudflared/postinst' "$RECIPE"; then
+            echo "Errore: la ricetta contiene già un postinst specifico."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("feeds/packages/net/cloudflared/Makefile")
+          text = path.read_text()
+          marker = "$(eval $(call BuildPackage,cloudflared))"
+          if text.count(marker) != 1:
+              raise SystemExit("Impossibile individuare BuildPackage,cloudflared")
+
+          hook = """define Package/cloudflared/postinst
+          #!/bin/sh
+          [ -n "$${IPKG_INSTROOT}" ] && exit 0
+
+          if [ -x /etc/init.d/cloudflared ] && /etc/init.d/cloudflared enabled; then
+              if /etc/init.d/cloudflared status >/dev/null 2>&1; then
+                  /etc/init.d/cloudflared restart
+              fi
+          fi
+
+          endef
+
+          """
+
+          path.write_text(text.replace(marker, hook + marker))
+          PY
+
+          echo "Hook aggiunto alla ricetta:"
+          grep -nA14 '^define Package/cloudflared/postinst' "$RECIPE"
 
       - name: Remove stale Go artifacts
         working-directory: sdk
@@ -484,6 +563,7 @@ jobs:
       - name: Collect current package only
         shell: bash
         env:
+          PACKAGE_RELEASE: ${{ needs.resolve-versions.outputs.package_release }}
           CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
           OPENWRT_VERSION: ${{ needs.resolve-versions.outputs.openwrt_version }}
         run: |
@@ -494,20 +574,15 @@ jobs:
           rm -rf "$FEED_DIR"
           mkdir -p "$FEED_DIR"
 
-          APK="$(
-            find sdk/bin/packages/${PACKAGE_ARCH} \
-              -type f \
-              -name "cloudflared-${CF_VERSION}-*.apk" \
-              | head -n1
-          )"
-
-          test -n "$APK"
+          APK="sdk/bin/packages/${PACKAGE_ARCH}/cloudflared-${CF_VERSION}-r${PACKAGE_RELEASE}.apk"
+          test -f "$APK"
 
           cp "$APK" "$FEED_DIR/"
 
       - name: Create APK repository index
         working-directory: feed/releases/${{ needs.resolve-versions.outputs.openwrt_version }}/${{ env.PACKAGE_ARCH }}
         env:
+          PACKAGE_RELEASE: ${{ needs.resolve-versions.outputs.package_release }}
           APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
         shell: bash
         run: |
@@ -559,6 +634,7 @@ jobs:
       - name: Publish GitHub release
         shell: bash
         env:
+          PACKAGE_RELEASE: ${{ needs.resolve-versions.outputs.package_release }}
           GH_TOKEN: ${{ github.token }}
           CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
           OPENWRT_VERSION: ${{ needs.resolve-versions.outputs.openwrt_version }}
@@ -567,21 +643,16 @@ jobs:
 
           TAG="cloudflared-${CF_VERSION}-openwrt-${OPENWRT_VERSION}"
 
-          APK_PATH="$(
-            find "feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}" \
-              -type f \
-              -name "cloudflared-${CF_VERSION}-*.apk" \
-              | head -n1
-          )"
-
-          test -n "$APK_PATH"
+          APK_PATH="feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}/cloudflared-${CF_VERSION}-r${PACKAGE_RELEASE}.apk"
+          test -f "$APK_PATH"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$APK_PATH" --clobber
+            gh release delete-asset "$TAG" "$(basename "$APK_PATH")" --yes 2>/dev/null || true
+            gh release upload "$TAG" "$APK_PATH"
           else
             gh release create "$TAG" \
               --title "cloudflared ${CF_VERSION} per OpenWrt ${OPENWRT_VERSION}" \
-              --notes "Pacchetto OpenWrt ${OPENWRT_VERSION} per rockchip/armv8 (aarch64_generic)." \
+              --notes "Pacchetto cloudflared ${CF_VERSION}-r${PACKAGE_RELEASE} per OpenWrt ${OPENWRT_VERSION} (rockchip/armv8, aarch64_generic). Il servizio viene riavviato automaticamente dopo l'aggiornamento se era attivo." \
               "$APK_PATH"
           fi
 
@@ -597,6 +668,7 @@ jobs:
       - name: Prepare publication metadata
         shell: bash
         env:
+          PACKAGE_RELEASE: ${{ needs.resolve-versions.outputs.package_release }}
           CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
           OPENWRT_VERSION: ${{ needs.resolve-versions.outputs.openwrt_version }}
         run: |
@@ -607,6 +679,7 @@ jobs:
           from pathlib import Path
           data = {"cloudflared_version": os.environ["CF_VERSION"],
                   "openwrt_version": os.environ["OPENWRT_VERSION"],
+                  "package_release": int(os.environ["PACKAGE_RELEASE"]),
                   "target": os.environ["TARGET"], "package_arch": os.environ["PACKAGE_ARCH"]}
           path = Path("feed/metadata") / data["openwrt_version"] / (data["package_arch"] + ".json")
           path.write_text(json.dumps(data, indent=2) + "\n")

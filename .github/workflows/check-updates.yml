@@ -27,6 +27,7 @@ jobs:
       cloudflared_version: ${{ steps.versions.outputs.cloudflared_version }}
       openwrt_version: ${{ steps.versions.outputs.openwrt_version }}
       should_build: ${{ steps.versions.outputs.should_build }}
+      package_release: ${{ steps.versions.outputs.package_release }}
     steps:
       - name: Checkout default branch
         uses: actions/checkout@v7
@@ -58,6 +59,13 @@ jobs:
             status=$?
             if [[ "$status" -ne 2 ]]; then exit "$status"; fi
           fi
+          PACKAGE_RELEASE=1
+          if [[ -s "$STATE_FILE" ]]; then
+            CURRENT_RELEASE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("package_release", 0))' "$STATE_FILE")"
+            if [[ "$CURRENT_RELEASE" =~ ^[0-9]+$ ]]; then
+              PACKAGE_RELEASE="$CURRENT_RELEASE"
+            fi
+          fi
           SHOULD_BUILD="$(python3 - <<'PY'
           import json, os
           from pathlib import Path
@@ -73,11 +81,13 @@ jobs:
           echo "cloudflared_version=$CF_VERSION" >> "$GITHUB_OUTPUT"
           echo "openwrt_version=$OPENWRT_VERSION" >> "$GITHUB_OUTPUT"
           echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          echo "package_release=$PACKAGE_RELEASE" >> "$GITHUB_OUTPUT"
           {
             echo "### Controllo aggiornamenti"
             echo "- cloudflared: $CF_VERSION"
             echo "- OpenWrt: $OPENWRT_VERSION"
             echo "- Compilazione necessaria: $SHOULD_BUILD"
+            echo "- Revisione pacchetto corrente: r$PACKAGE_RELEASE"
             echo "- Evento: $GITHUB_EVENT_NAME"
           } >> "$GITHUB_STEP_SUMMARY"
 
