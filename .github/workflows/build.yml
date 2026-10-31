@@ -115,14 +115,15 @@ jobs:
           fi
 
           PACKAGE_RELEASE="$(
-            python3 - <<'PY'
-          import json, os
+            python3 - "$STATE_FILE" "$CF_VERSION" <<'PY'
+          import json, sys
           from pathlib import Path
 
-          path = Path(os.environ["STATE_FILE"])
+          state_file, cf_version = sys.argv[1], sys.argv[2]
+          path = Path(state_file)
           current = json.loads(path.read_text()) if path.exists() else {}
 
-          if current.get("cloudflared_version") != os.environ["CF_VERSION"]:
+          if current.get("cloudflared_version") != cf_version:
               print(1)
           else:
               print(max(int(current.get("package_release", 1)), 1) + 1)
@@ -131,7 +132,22 @@ jobs:
 
           echo "Versione cloudflared richiesta: $CF_VERSION"
           echo "Versione OpenWrt richiesta: $OPENWRT_VERSION"
-          echo "Ultima revisione pubblicata: $(python3 -c 'import json,os; p=os.environ.get("STATE_FILE",""); print(json.load(open(p)).get("package_release", "nessuna") if p and __import__("pathlib").Path(p).exists() else "nessuna")')"
+          if [[ -s "$STATE_FILE" ]]; then
+            LAST_RELEASE="$(
+              python3 - "$STATE_FILE" <<'PY'
+          import json, sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          data = json.loads(path.read_text())
+          print(data.get("package_release", "nessuna"))
+          PY
+            )"
+          else
+            LAST_RELEASE="nessuna"
+          fi
+
+          echo "Ultima revisione pubblicata: $LAST_RELEASE"
           echo "Revisione che verrà pubblicata: r$PACKAGE_RELEASE"
 
           echo "cloudflared_version=$CF_VERSION" >> "$GITHUB_OUTPUT"
