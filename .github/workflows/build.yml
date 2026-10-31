@@ -49,7 +49,7 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
-        
+
       - name: Resolve cloudflared and OpenWrt versions
         id: versions
         shell: bash
@@ -97,23 +97,42 @@ jobs:
 
           SHOULD_BUILD=true
           PACKAGE_RELEASE=1
+          STATE_FILE="$RUNNER_TEMP/publication.json"
 
           if git ls-remote --exit-code --heads origin feed-state > "$RUNNER_TEMP/feed-ref"; then
             git fetch --depth=1 origin refs/heads/feed-state
+
             META="metadata/${OPENWRT_VERSION}/${PACKAGE_ARCH}.json"
+
             if git cat-file -e "FETCH_HEAD:$META" 2>/dev/null; then
-              CURRENT_RELEASE="$(
-                git show "FETCH_HEAD:$META" \
-                  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("package_release", 0))'
-              )"
-              if [[ "$CURRENT_RELEASE" =~ ^[0-9]+$ ]]; then
-                PACKAGE_RELEASE="$CURRENT_RELEASE"
-              fi
+              git show "FETCH_HEAD:$META" > "$STATE_FILE"
             fi
           else
             status=$?
-            if [[ "$status" -ne 2 ]]; then exit "$status"; fi
+            if [[ "$status" -ne 2 ]]; then
+              exit "$status"
+            fi
           fi
+
+          PACKAGE_RELEASE="$(
+            python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          path = Path(os.environ["STATE_FILE"])
+          current = json.loads(path.read_text()) if path.exists() else {}
+
+          if current.get("cloudflared_version") != os.environ["CF_VERSION"]:
+              print(1)
+          else:
+              print(max(int(current.get("package_release", 1)), 1) + 1)
+          PY
+          )"
+
+          echo "Versione cloudflared richiesta: $CF_VERSION"
+          echo "Versione OpenWrt richiesta: $OPENWRT_VERSION"
+          echo "Ultima revisione pubblicata: $(python3 -c 'import json,os; p=os.environ.get("STATE_FILE",""); print(json.load(open(p)).get("package_release", "nessuna") if p and __import__("pathlib").Path(p).exists() else "nessuna")')"
+          echo "Revisione che verrà pubblicata: r$PACKAGE_RELEASE"
 
           echo "cloudflared_version=$CF_VERSION" >> "$GITHUB_OUTPUT"
           echo "openwrt_version=$OPENWRT_VERSION" >> "$GITHUB_OUTPUT"
