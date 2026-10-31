@@ -1,6 +1,8 @@
 {
   "cloudflared_version": "2026.10.7",
   "openwrt_version": "25.12.6",
+  "package_release": 2,
+  "packaging_hash": "f1d71f2e1f59d4d2955f49b74502c7e2f1653db3b21dc8c830dd26c1c475b912",
   "target": "rockchip/armv8",
   "package_arch": "aarch64_generic"
 }
