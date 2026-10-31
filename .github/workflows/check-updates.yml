@@ -27,7 +27,6 @@ jobs:
       cloudflared_version: ${{ steps.versions.outputs.cloudflared_version }}
       openwrt_version: ${{ steps.versions.outputs.openwrt_version }}
       should_build: ${{ steps.versions.outputs.should_build }}
-      package_release: ${{ steps.versions.outputs.package_release }}
     steps:
       - name: Checkout default branch
         uses: actions/checkout@v7
@@ -59,19 +58,15 @@ jobs:
             status=$?
             if [[ "$status" -ne 2 ]]; then exit "$status"; fi
           fi
-          PACKAGE_RELEASE=1
-          if [[ -s "$STATE_FILE" ]]; then
-            CURRENT_RELEASE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("package_release", 0))' "$STATE_FILE")"
-            if [[ "$CURRENT_RELEASE" =~ ^[0-9]+$ ]]; then
-              PACKAGE_RELEASE="$CURRENT_RELEASE"
-            fi
-          fi
+          PACKAGING_HASH="$(sha256sum .github/workflows/build.yml | awk '{print $1}')"
+          export PACKAGING_HASH
           SHOULD_BUILD="$(python3 - <<'PY'
           import json, os
           from pathlib import Path
           expected = {"cloudflared_version": os.environ["CF_VERSION"],
                       "openwrt_version": os.environ["OPENWRT_VERSION"],
-                      "target": "rockchip/armv8", "package_arch": "aarch64_generic"}
+                      "target": "rockchip/armv8", "package_arch": "aarch64_generic",
+                      "packaging_hash": os.environ["PACKAGING_HASH"]}
           path = Path(os.environ["STATE_FILE"])
           current = json.loads(path.read_text()) if path.exists() else {}
           rebuild = os.environ.get("FORCE", "").lower() == "true" or any(current.get(k) != v for k, v in expected.items())
@@ -81,13 +76,11 @@ jobs:
           echo "cloudflared_version=$CF_VERSION" >> "$GITHUB_OUTPUT"
           echo "openwrt_version=$OPENWRT_VERSION" >> "$GITHUB_OUTPUT"
           echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
-          echo "package_release=$PACKAGE_RELEASE" >> "$GITHUB_OUTPUT"
           {
             echo "### Controllo aggiornamenti"
             echo "- cloudflared: $CF_VERSION"
             echo "- OpenWrt: $OPENWRT_VERSION"
             echo "- Compilazione necessaria: $SHOULD_BUILD"
-            echo "- Revisione pacchetto corrente: r$PACKAGE_RELEASE"
             echo "- Evento: $GITHUB_EVENT_NAME"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -107,7 +100,8 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .github/keepalive.txt
           git commit -m "chore: scheduled workflow keepalive"
-          git push origin "HEAD:refs/heads/${{ github.event.repository.default_branch }}"
+          git push origin "HEAD:refs/heads/${{ github.event.repository.default_branch }}" || \
+            echo "::warning::Keepalive push failed; check branch protection rules."
 
   call-build:
     needs: check

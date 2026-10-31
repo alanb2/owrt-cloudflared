@@ -45,6 +45,7 @@ jobs:
       openwrt_version: ${{ steps.versions.outputs.openwrt_version }}
       should_build: ${{ steps.versions.outputs.should_build }}
       package_release: ${{ steps.versions.outputs.package_release }}
+      packaging_hash: ${{ steps.versions.outputs.packaging_hash }}
 
     steps:
       - name: Checkout repository
@@ -96,64 +97,60 @@ jobs:
           fi
 
           SHOULD_BUILD=true
-          PACKAGE_RELEASE=1
           STATE_FILE="$RUNNER_TEMP/publication.json"
-
+          rm -f "$STATE_FILE"
           if git ls-remote --exit-code --heads origin feed-state > "$RUNNER_TEMP/feed-ref"; then
             git fetch --depth=1 origin refs/heads/feed-state
-
             META="metadata/${OPENWRT_VERSION}/${PACKAGE_ARCH}.json"
-
             if git cat-file -e "FETCH_HEAD:$META" 2>/dev/null; then
               git show "FETCH_HEAD:$META" > "$STATE_FILE"
             fi
+            git ls-tree -r --name-only FETCH_HEAD > "$RUNNER_TEMP/published-paths.txt"
           else
             status=$?
-            if [[ "$status" -ne 2 ]]; then
-              exit "$status"
-            fi
+            if [[ "$status" -ne 2 ]]; then exit "$status"; fi
+            : > "$RUNNER_TEMP/published-paths.txt"
           fi
-
-          PACKAGE_RELEASE="$(
-            python3 - "$STATE_FILE" "$CF_VERSION" <<'PY'
-          import json, sys
+          PACKAGING_HASH="$(sha256sum .github/workflows/build.yml | awk '{print $1}')"
+          PACKAGE_RELEASE="$(python3 - "$STATE_FILE" "$CF_VERSION" "$OPENWRT_VERSION" "$PACKAGE_ARCH" "$RUNNER_TEMP/published-paths.txt" <<'PY'
+          import json, os, re, subprocess, sys
           from pathlib import Path
-
-          state_file, cf_version = sys.argv[1], sys.argv[2]
-          path = Path(state_file)
-          current = json.loads(path.read_text()) if path.exists() else {}
-
-          if current.get("cloudflared_version") != cf_version:
-              print(1)
+          state_file, version, owrt, arch, paths_file = sys.argv[1:]
+          state = json.loads(Path(state_file).read_text()) if Path(state_file).exists() else {}
+          revisions = []
+          if state.get("cloudflared_version") == version:
+              revision = state.get("package_release", 1)
+              if isinstance(revision, bool) or not str(revision).isdigit() or int(revision) < 1:
+                  raise SystemExit("Revisione non valida nei metadati pubblicati")
+              revisions.append(int(revision))
+          pattern = re.compile(r"cloudflared-" + re.escape(version) + r"-r([1-9][0-9]*)\.apk")
+          for path in Path(paths_file).read_text().splitlines():
+              if path.startswith(f"releases/{owrt}/{arch}/"):
+                  match = pattern.fullmatch(Path(path).name)
+                  if match:
+                      revisions.append(int(match[1]))
+          tag = f"cloudflared-{version}-openwrt-{owrt}"
+          result = subprocess.run(["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/releases/tags/{tag}"], capture_output=True, text=True)
+          if result.returncode:
+              if "HTTP 404" not in result.stderr:
+                  raise SystemExit(result.stderr)
           else:
-              print(max(int(current.get("package_release", 1)), 1) + 1)
+              release = json.loads(result.stdout)
+              for asset in release.get("assets", []):
+                  match = pattern.fullmatch(asset["name"])
+                  if match:
+                      revisions.append(int(match[1]))
+          print(max(revisions, default=0) + 1)
           PY
           )"
-
-          echo "Versione cloudflared richiesta: $CF_VERSION"
-          echo "Versione OpenWrt richiesta: $OPENWRT_VERSION"
-          if [[ -s "$STATE_FILE" ]]; then
-            LAST_RELEASE="$(
-              python3 - "$STATE_FILE" <<'PY'
-          import json, sys
-          from pathlib import Path
-
-          path = Path(sys.argv[1])
-          data = json.loads(path.read_text())
-          print(data.get("package_release", "nessuna"))
-          PY
-            )"
-          else
-            LAST_RELEASE="nessuna"
-          fi
-
-          echo "Ultima revisione pubblicata: $LAST_RELEASE"
-          echo "Revisione che verrà pubblicata: r$PACKAGE_RELEASE"
-
+          [[ "$PACKAGE_RELEASE" =~ ^[1-9][0-9]*$ ]]
+          echo "Versione richiesta: ${CF_VERSION}; OpenWrt: ${OPENWRT_VERSION}"
+          echo "Nuova revisione: r${PACKAGE_RELEASE} (massimo già pubblicato + 1)"
           echo "cloudflared_version=$CF_VERSION" >> "$GITHUB_OUTPUT"
           echo "openwrt_version=$OPENWRT_VERSION" >> "$GITHUB_OUTPUT"
           echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
           echo "package_release=$PACKAGE_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "packaging_hash=$PACKAGING_HASH" >> "$GITHUB_OUTPUT"
 
   resolve-toolchain:
     needs: resolve-versions
@@ -200,13 +197,14 @@ jobs:
                 "$GO_MAJOR_MINOR"
           )"
 
-          GO_RECIPE_AVAILABLE="$(
-            curl --fail --location --silent \
+          GO_RECIPE_AVAILABLE=false
+          if curl --fail --location --silent --retry 3 \
               "https://raw.githubusercontent.com/openwrt/packages/master/lang/golang/golang${GO_MAJOR_MINOR}/Makefile" \
-              | grep -q '^PKG_NAME:=golang' \
-              && echo true \
-              || echo false
-          )"
+              -o "$RUNNER_TEMP/go-recipe.mk"; then
+            if grep -q '^PKG_NAME:=golang' "$RUNNER_TEMP/go-recipe.mk"; then
+              GO_RECIPE_AVAILABLE=true
+            fi
+          fi
 
           echo "Requisito cloudflared: Go $GO_VERSION"
           echo "Serie Go richiesta: $GO_MAJOR_MINOR"
@@ -429,7 +427,7 @@ jobs:
 
           sed -i \
             -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${CF_VERSION}/" \
-            -e "s/^PKG_RELEASE:=.*/PKG_RELEASE:=\${PACKAGE_RELEASE}/" \
+            -e "s/^PKG_RELEASE:=.*/PKG_RELEASE:=${PACKAGE_RELEASE}/" \
             -e "s|^PKG_HASH:=.*|PKG_HASH:=${CF_HASH}|" \
             -e "s|^PKG_BUILD_DEPENDS:=.*|PKG_BUILD_DEPENDS:=golang${GO_MAJOR_MINOR}/host|" \
             feeds/packages/net/cloudflared/Makefile
@@ -442,6 +440,9 @@ jobs:
           echo "Ricetta cloudflared aggiornata:"
           grep -E '^(PKG_VERSION|PKG_RELEASE|PKG_HASH|PKG_BUILD_DEPENDS):=' \
             feeds/packages/net/cloudflared/Makefile
+
+          grep -qx "PKG_RELEASE:=${PACKAGE_RELEASE}" feeds/packages/net/cloudflared/Makefile
+          [[ "$PACKAGE_RELEASE" =~ ^[1-9][0-9]*$ ]]
 
       - name: Inspect cloudflared packaging hooks
         working-directory: sdk
@@ -483,13 +484,13 @@ jobs:
 
           hook = """define Package/cloudflared/postinst
           #!/bin/sh
-          [ -n "$${IPKG_INSTROOT}" ] && exit 0
-
-          if [ -x /etc/init.d/cloudflared ] && /etc/init.d/cloudflared enabled; then
+          if [ -z "$${IPKG_INSTROOT}" ] && [ -x /etc/init.d/cloudflared ]; then
               if /etc/init.d/cloudflared status >/dev/null 2>&1; then
-                  /etc/init.d/cloudflared restart
+                  /etc/init.d/cloudflared restart || \
+                      echo "cloudflared: riavvio fallito, controllare il servizio" >&2
               fi
           fi
+          :
 
           endef
 
@@ -606,16 +607,23 @@ jobs:
           OPENWRT_VERSION: ${{ needs.resolve-versions.outputs.openwrt_version }}
         run: |
           set -euo pipefail
-
+          [[ "$PACKAGE_RELEASE" =~ ^[1-9][0-9]*$ ]]
+          EXPECTED="cloudflared-${CF_VERSION}-r${PACKAGE_RELEASE}.apk"
+          ROOT="sdk/bin/packages/${PACKAGE_ARCH}"
+          echo "APK atteso: $EXPECTED"
+          echo "APK prodotti:"
+          find "$ROOT" -type f -name 'cloudflared-*.apk' -print
+          mapfile -d '' -t MATCHES < <(find "$ROOT" -type f -name "$EXPECTED" -print0)
+          if [[ ${#MATCHES[@]} -ne 1 ]]; then
+            echo "Errore: atteso esattamente un APK $EXPECTED; trovati ${#MATCHES[@]}." >&2
+            echo "Ricetta usata:"
+            grep -E '^(PKG_VERSION|PKG_RELEASE):=' sdk/feeds/packages/net/cloudflared/Makefile
+            exit 1
+          fi
           FEED_DIR="feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}"
-
           rm -rf "$FEED_DIR"
           mkdir -p "$FEED_DIR"
-
-          APK="sdk/bin/packages/${PACKAGE_ARCH}/cloudflared-${CF_VERSION}-r${PACKAGE_RELEASE}.apk"
-          test -f "$APK"
-
-          cp "$APK" "$FEED_DIR/"
+          cp "${MATCHES[0]}" "$FEED_DIR/"
 
       - name: Create APK repository index
         working-directory: feed/releases/${{ needs.resolve-versions.outputs.openwrt_version }}/${{ env.PACKAGE_ARCH }}
@@ -678,19 +686,19 @@ jobs:
           OPENWRT_VERSION: ${{ needs.resolve-versions.outputs.openwrt_version }}
         run: |
           set -euo pipefail
-
           TAG="cloudflared-${CF_VERSION}-openwrt-${OPENWRT_VERSION}"
-
           APK_PATH="feed/releases/${OPENWRT_VERSION}/${PACKAGE_ARCH}/cloudflared-${CF_VERSION}-r${PACKAGE_RELEASE}.apk"
           test -f "$APK_PATH"
-
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release delete-asset "$TAG" "$(basename "$APK_PATH")" --yes 2>/dev/null || true
+          if gh release view "$TAG" >/dev/null 2>"$RUNNER_TEMP/release-error"; then
             gh release upload "$TAG" "$APK_PATH"
           else
+            if ! grep -qiE 'not found|404' "$RUNNER_TEMP/release-error"; then
+              cat "$RUNNER_TEMP/release-error" >&2
+              exit 1
+            fi
             gh release create "$TAG" \
               --title "cloudflared ${CF_VERSION} per OpenWrt ${OPENWRT_VERSION}" \
-              --notes "Pacchetto cloudflared ${CF_VERSION}-r${PACKAGE_RELEASE} per OpenWrt ${OPENWRT_VERSION} (rockchip/armv8, aarch64_generic). Il servizio viene riavviato automaticamente dopo l'aggiornamento se era attivo." \
+              --notes "Pacchetto cloudflared ${CF_VERSION}-r${PACKAGE_RELEASE} per OpenWrt ${OPENWRT_VERSION} (rockchip/armv8, aarch64_generic)." \
               "$APK_PATH"
           fi
 
@@ -706,6 +714,7 @@ jobs:
       - name: Prepare publication metadata
         shell: bash
         env:
+          PACKAGING_HASH: ${{ needs.resolve-versions.outputs.packaging_hash }}
           PACKAGE_RELEASE: ${{ needs.resolve-versions.outputs.package_release }}
           CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
           OPENWRT_VERSION: ${{ needs.resolve-versions.outputs.openwrt_version }}
@@ -718,6 +727,7 @@ jobs:
           data = {"cloudflared_version": os.environ["CF_VERSION"],
                   "openwrt_version": os.environ["OPENWRT_VERSION"],
                   "package_release": int(os.environ["PACKAGE_RELEASE"]),
+                  "packaging_hash": os.environ["PACKAGING_HASH"],
                   "target": os.environ["TARGET"], "package_arch": os.environ["PACKAGE_ARCH"]}
           path = Path("feed/metadata") / data["openwrt_version"] / (data["package_arch"] + ".json")
           path.write_text(json.dumps(data, indent=2) + "\n")
@@ -785,3 +795,21 @@ jobs:
             git commit -m "Persist deployed cloudflared feed"
             git push origin HEAD:refs/heads/feed-state
           fi
+
+      - name: Remove superseded APK assets after successful deployment
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
+          OPENWRT_VERSION: ${{ needs.resolve-versions.outputs.openwrt_version }}
+          PACKAGE_RELEASE: ${{ needs.resolve-versions.outputs.package_release }}
+        run: |
+          set -euo pipefail
+          TAG="cloudflared-${CF_VERSION}-openwrt-${OPENWRT_VERSION}"
+          KEEP="cloudflared-${CF_VERSION}-r${PACKAGE_RELEASE}.apk"
+          gh release view "$TAG" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/release-assets"
+          while IFS= read -r ASSET; do
+            if [[ "$ASSET" == cloudflared-"${CF_VERSION}"-r*.apk && "$ASSET" != "$KEEP" ]]; then
+              gh release delete-asset "$TAG" "$ASSET" --yes
+            fi
+          done < "$RUNNER_TEMP/release-assets"
