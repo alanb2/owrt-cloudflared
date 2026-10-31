@@ -800,16 +800,26 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
           OPENWRT_VERSION: ${{ needs.resolve-versions.outputs.openwrt_version }}
           PACKAGE_RELEASE: ${{ needs.resolve-versions.outputs.package_release }}
         run: |
           set -euo pipefail
+
           TAG="cloudflared-${CF_VERSION}-openwrt-${OPENWRT_VERSION}"
           KEEP="cloudflared-${CF_VERSION}-r${PACKAGE_RELEASE}.apk"
-          gh release view "$TAG" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/release-assets"
+
+          gh release view "$TAG" \
+            --repo "$GH_REPO" \
+            --json assets \
+            --jq '.assets[].name' > "$RUNNER_TEMP/release-assets"
+
           while IFS= read -r ASSET; do
-            if [[ "$ASSET" == cloudflared-"${CF_VERSION}"-r*.apk && "$ASSET" != "$KEEP" ]]; then
-              gh release delete-asset "$TAG" "$ASSET" --yes
+            if [[ "$ASSET" == "cloudflared-${CF_VERSION}-r"*.apk && "$ASSET" != "$KEEP" ]]; then
+              echo "Rimuovo asset obsoleto: $ASSET"
+              gh release delete-asset "$TAG" "$ASSET" \
+                --repo "$GH_REPO" \
+                --yes
             fi
           done < "$RUNNER_TEMP/release-assets"
