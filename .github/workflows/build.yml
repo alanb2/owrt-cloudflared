@@ -47,6 +47,9 @@ jobs:
       package_release: ${{ steps.versions.outputs.package_release }}
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        
       - name: Resolve cloudflared and OpenWrt versions
         id: versions
         shell: bash
