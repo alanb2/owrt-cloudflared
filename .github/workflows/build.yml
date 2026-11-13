@@ -487,6 +487,19 @@ jobs:
           grep -qx "PKG_RELEASE:=${PACKAGE_RELEASE}" feeds/packages/net/cloudflared/Makefile
           [[ "$PACKAGE_RELEASE" =~ ^[1-9][0-9]*$ ]]
 
+      - name: Inspect cloudflared source layout
+        working-directory: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "### Struttura dell'archivio cloudflared"
+          tar -tzf "dl/cloudflared-${CF_VERSION}.tar.gz" | head -n 40
+
+          echo "### File Go module trovati"
+          tar -tzf "dl/cloudflared-${CF_VERSION}.tar.gz" \
+            | grep -E '(^|/)go\.(mod|work|sum)$' || true
+
       - name: Inspect cloudflared packaging hooks
         working-directory: sdk
         shell: bash
