@@ -64,13 +64,14 @@ jobs:
 
           if [[ -n "$INPUT_CLOUDFLARED_VERSION" ]]; then
             CF_VERSION="$INPUT_CLOUDFLARED_VERSION"
+            CF_TAG="v${CF_VERSION}"
           else
             CF_TAG="$(
               gh api repos/cloudflare/cloudflared/releases/latest \
                 --jq '.tag_name'
             )"
 
-          CF_VERSION="${CF_TAG#v}"
+            CF_VERSION="${CF_TAG#v}"
           fi
 
           if [[ -n "$INPUT_OPENWRT_VERSION" ]]; then
