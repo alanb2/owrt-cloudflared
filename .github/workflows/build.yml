@@ -170,13 +170,29 @@ jobs:
         run: |
           set -euo pipefail
 
+          SOURCE_URL="https://codeload.github.com/cloudflare/cloudflared/tar.gz/${CF_VERSION}"
+          SOURCE_FILE="$RUNNER_TEMP/cloudflared-source.tar.gz"
+
           curl --fail --location --retry 3 \
-            "https://raw.githubusercontent.com/cloudflare/cloudflared/${CF_VERSION}/go.mod" \
-            -o "$RUNNER_TEMP/cloudflared-go.mod"
+            "$SOURCE_URL" \
+            -o "$SOURCE_FILE"
+
+          SOURCE_DIR="$RUNNER_TEMP/cloudflared-source"
+          rm -rf "$SOURCE_DIR"
+          mkdir -p "$SOURCE_DIR"
+          tar -xzf "$SOURCE_FILE" -C "$SOURCE_DIR" --strip-components=1
+
+          GO_MOD="$(
+            find "$SOURCE_DIR" \
+              -type f \
+              -name go.mod \
+              | head -n1
+          )"
+
+          test -n "$GO_MOD"
 
           GO_VERSION="$(
-            awk '$1 == "go" { print $2; exit }' \
-              "$RUNNER_TEMP/cloudflared-go.mod"
+            awk '$1 == "go" { print $2; exit }' "$GO_MOD"
           )"
 
           if [[ ! "$GO_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -186,18 +202,31 @@ jobs:
 
           GO_MAJOR_MINOR="${GO_VERSION%.*}"
 
-          GO_RELEASES="$(
-            curl --fail --location --retry 3 \
-              'https://go.dev/dl/?mode=json&include=all'
-          )"
+          GO_META_FILE="$RUNNER_TEMP/go-releases.json"
+
+          curl --fail --location --retry 3 \
+            'https://go.dev/dl/?mode=json&include=all' \
+            -o "$GO_META_FILE"
 
           GO_LATEST_PATCH="$(
-            printf '%s' "$GO_RELEASES" \
-              | python3 -c 'import json,sys; data=json.load(sys.stdin); series=sys.argv[1]; versions=[r["version"].removeprefix("go") for r in data if r.get("stable") and r["version"].removeprefix("go").startswith(series+".")]; print(max(versions, key=lambda value: tuple(map(int, value.split(".")))))' \
-                "$GO_MAJOR_MINOR"
+            python3 - "$GO_META_FILE" "$GO_MAJOR_MINOR" <<'PY'
+          import json, sys
+          from pathlib import Path
+
+          data = json.loads(Path(sys.argv[1]).read_text())
+          series = sys.argv[2]
+          versions = [
+              release["version"].removeprefix("go")
+              for release in data
+              if release.get("stable")
+              and release["version"].removeprefix("go").startswith(series + ".")
+          ]
+          print(max(versions, key=lambda value: tuple(map(int, value.split(".")))))
+          PY
           )"
 
           GO_RECIPE_AVAILABLE=false
+
           if curl --fail --location --silent --retry 3 \
               "https://raw.githubusercontent.com/openwrt/packages/master/lang/golang/golang${GO_MAJOR_MINOR}/Makefile" \
               -o "$RUNNER_TEMP/go-recipe.mk"; then
@@ -214,7 +243,7 @@ jobs:
           echo "go_version=$GO_LATEST_PATCH" >> "$GITHUB_OUTPUT"
           echo "go_major_minor=$GO_MAJOR_MINOR" >> "$GITHUB_OUTPUT"
           echo "go_recipe_available=$GO_RECIPE_AVAILABLE" >> "$GITHUB_OUTPUT"
-
+          
   build:
     needs:
       - resolve-versions
