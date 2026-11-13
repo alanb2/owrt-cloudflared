@@ -170,7 +170,7 @@ jobs:
         id: go
         shell: bash
         env:
-          CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
+          CF_TAG: ${{ needs.resolve-versions.outputs.cloudflared_tag }}
         run: |
           set -euo pipefail
 
