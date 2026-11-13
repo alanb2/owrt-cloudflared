@@ -42,6 +42,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       cloudflared_version: ${{ steps.versions.outputs.cloudflared_version }}
+      cloudflared_tag: ${{ steps.versions.outputs.cloudflared_tag }}
       openwrt_version: ${{ steps.versions.outputs.openwrt_version }}
       should_build: ${{ steps.versions.outputs.should_build }}
       package_release: ${{ steps.versions.outputs.package_release }}
@@ -64,11 +65,12 @@ jobs:
           if [[ -n "$INPUT_CLOUDFLARED_VERSION" ]]; then
             CF_VERSION="$INPUT_CLOUDFLARED_VERSION"
           else
-            CF_VERSION="$(
+            CF_TAG="$(
               gh api repos/cloudflare/cloudflared/releases/latest \
-                --jq '.tag_name' \
-                | sed 's/^v//'
+                --jq '.tag_name'
             )"
+
+          CF_VERSION="${CF_TAG#v}"
           fi
 
           if [[ -n "$INPUT_OPENWRT_VERSION" ]]; then
@@ -147,6 +149,7 @@ jobs:
           echo "Versione richiesta: ${CF_VERSION}; OpenWrt: ${OPENWRT_VERSION}"
           echo "Nuova revisione: r${PACKAGE_RELEASE} (massimo già pubblicato + 1)"
           echo "cloudflared_version=$CF_VERSION" >> "$GITHUB_OUTPUT"
+          echo "cloudflared_tag=$CF_TAG" >> "$GITHUB_OUTPUT"
           echo "openwrt_version=$OPENWRT_VERSION" >> "$GITHUB_OUTPUT"
           echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
           echo "package_release=$PACKAGE_RELEASE" >> "$GITHUB_OUTPUT"
@@ -170,7 +173,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          SOURCE_URL="https://codeload.github.com/cloudflare/cloudflared/tar.gz/${CF_VERSION}"
+          SOURCE_URL="https://codeload.github.com/cloudflare/cloudflared/tar.gz/${CF_TAG}"
           SOURCE_FILE="$RUNNER_TEMP/cloudflared-source.tar.gz"
 
           curl --fail --location --retry 3 \
@@ -243,7 +246,7 @@ jobs:
           echo "go_version=$GO_LATEST_PATCH" >> "$GITHUB_OUTPUT"
           echo "go_major_minor=$GO_MAJOR_MINOR" >> "$GITHUB_OUTPUT"
           echo "go_recipe_available=$GO_RECIPE_AVAILABLE" >> "$GITHUB_OUTPUT"
-          
+
   build:
     needs:
       - resolve-versions
@@ -439,6 +442,7 @@ jobs:
         working-directory: sdk
         env:
           CF_VERSION: ${{ needs.resolve-versions.outputs.cloudflared_version }}
+          CF_TAG: ${{ needs.resolve-versions.outputs.cloudflared_tag }}
           PACKAGE_RELEASE: ${{ needs.resolve-versions.outputs.package_release }}
           GO_MAJOR_MINOR: ${{ needs.resolve-toolchain.outputs.go_major_minor }}
         shell: bash
@@ -446,7 +450,7 @@ jobs:
           set -euo pipefail
 
           curl --fail --location --retry 3 \
-            "https://codeload.github.com/cloudflare/cloudflared/tar.gz/${CF_VERSION}" \
+            "https://codeload.github.com/cloudflare/cloudflared/tar.gz/${CF_TAG}" \
             -o "$RUNNER_TEMP/cloudflared-source.tar.gz"
 
           CF_HASH="$(
